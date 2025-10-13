@@ -7,7 +7,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, HttpUrl, ValidationError
 
 app = FastAPI(
     title="M3U8 Proxy Server",
@@ -236,18 +236,24 @@ async def m3u8_proxy(base64_data: str, request: Request):
         except httpx.RequestError as e:
             raise HTTPException(status_code=502, detail=f"Upstream request failed: {str(e)}")
 
-    # Get content
-    content = response.text
-
-    # Rewrite URLs if this is a source playlist
-    if proxy_data.src:
-        content = rewrite_m3u8_urls(content, proxy_data, str(request.url))
-
-    # Determine content type
+    # Determine content type first
     content_type = determine_content_type(
         proxy_data.url,
         response.headers.get("content-type", "")
     )
+    
+    # Check if content will be modified (M3U8 playlists with rewriting enabled)
+    is_m3u8 = '.m3u8' in proxy_data.url.lower()
+    will_modify = proxy_data.src and is_m3u8
+    
+    # Get content - use text for M3U8, binary for everything else
+    if is_m3u8:
+        content = response.text
+        # Rewrite URLs if this is a source playlist
+        if proxy_data.src:
+            content = rewrite_m3u8_urls(content, proxy_data, str(request.url))
+    else:
+        content = response.content
     
     # Build response headers
     response_headers = {
@@ -256,10 +262,11 @@ async def m3u8_proxy(base64_data: str, request: Request):
         "Access-Control-Expose-Headers": "*"
     }
     
-    # Preserve important upstream headers
-    for header in ["Content-Length", "Last-Modified", "ETag"]:
-        if header in response.headers:
-            response_headers[header] = response.headers[header]
+    # Only preserve upstream headers if content wasn't modified
+    if not will_modify:
+        for header in ["Content-Length", "Last-Modified", "ETag"]:
+            if header in response.headers:
+                response_headers[header] = response.headers[header]
     
     return Response(
         content=content,
@@ -283,3 +290,4 @@ def read_root():
 def health_check():
     """Health check for monitoring"""
     return {"status": "healthy"}
+
