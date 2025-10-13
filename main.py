@@ -242,17 +242,16 @@ async def m3u8_proxy(base64_data: str, request: Request):
         response.headers.get("content-type", "")
     )
     
-    # Check if content will be modified (M3U8 playlists with rewriting enabled)
-    is_m3u8 = '.m3u8' in proxy_data.url.lower()
+    # Check if this is an M3U8 playlist that needs rewriting
+    is_m3u8 = '.m3u8' in proxy_data.url.lower() or content_type == "application/vnd.apple.mpegurl"
     will_modify = proxy_data.src and is_m3u8
     
-    # Get content - use text for M3U8, binary for everything else
-    if is_m3u8:
+    # Get content - use text ONLY for M3U8 that will be rewritten, binary for everything else
+    if will_modify:
         content = response.text
-        # Rewrite URLs if this is a source playlist
-        if proxy_data.src:
-            content = rewrite_m3u8_urls(content, proxy_data, str(request.url))
+        content = rewrite_m3u8_urls(content, proxy_data, str(request.url))
     else:
+        # Keep as binary for all media segments (TS, MP4, etc.)
         content = response.content
     
     # Build response headers
@@ -290,4 +289,3 @@ def read_root():
 def health_check():
     """Health check for monitoring"""
     return {"status": "healthy"}
-
