@@ -1,4 +1,5 @@
 import base64
+import binascii
 import json
 import re
 from typing import Optional
@@ -25,13 +26,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Create a disk cache with LRU eviction and 1GB size limit
+# Create a disk cache with LRU eviction and 400MB size limit
 cache = Cache(
-    # for disk based cache
-    # "/tmp/m3u8_cache",
+    "/tmp/m3u8_cache",
     size_limit=400 * 1024 * 1024,  # 400 MB
     eviction_policy="least-recently-used",
-    memory=True,
 )
 
 
@@ -113,12 +112,16 @@ def rewrite_m3u8_urls(content: str, original_data: ProxyData, current_url: str) 
                 # Resolve to absolute URL
                 absolute_url = resolve_url(base_url, stripped)
 
+                # Determine if this is a playlist
+                is_playlist = ".m3u8" in absolute_url.lower()
+
                 # Create new proxy configuration
+                # Keep src=True for nested playlists, set src=False for segments
                 new_proxy_data = ProxyData(
                     url=absolute_url,
                     origin=original_data.origin,
                     referer=original_data.referer,
-                    src=False,  # Segments should not be rewritten further
+                    src=is_playlist,  # True for .m3u8, False for .ts and other segments
                 )
 
                 # Encode the proxy data
@@ -130,9 +133,6 @@ def rewrite_m3u8_urls(content: str, original_data: ProxyData, current_url: str) 
                     .decode("utf-8")
                     .rstrip("=")
                 )
-
-                # Determine if this is a playlist (for extension hint)
-                is_playlist = ".m3u8" in absolute_url.lower()
 
                 # Build proxied URL
                 proxied_url = f"{server_origin}/url/{base64_encoded}"
@@ -174,7 +174,7 @@ def decode_proxy_data(base64_data: str) -> ProxyData:
 
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON in proxy data: {e}")
-    except base64.binascii.Error as e:
+    except binascii.Error as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64 encoding: {e}")
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=f"Invalid proxy data format: {e}")
@@ -286,7 +286,6 @@ async def m3u8_proxy(base64_data: str, request: Request):
     )
 
 
-# Health endpoints unchanged
 @app.get("/")
 def read_root():
     return {
