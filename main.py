@@ -1,5 +1,4 @@
 import base64
-import binascii
 import json
 import re
 from typing import Optional
@@ -35,6 +34,8 @@ cache = Cache(
 
 
 class ProxyData(BaseModel):
+    """Data model for proxy configuration"""
+
     url: str
     origin: Optional[str] = None
     referer: Optional[str] = None
@@ -112,16 +113,12 @@ def rewrite_m3u8_urls(content: str, original_data: ProxyData, current_url: str) 
                 # Resolve to absolute URL
                 absolute_url = resolve_url(base_url, stripped)
 
-                # Determine if this is a playlist
-                is_playlist = ".m3u8" in absolute_url.lower()
-
                 # Create new proxy configuration
-                # Keep src=True for nested playlists, set src=False for segments
                 new_proxy_data = ProxyData(
                     url=absolute_url,
                     origin=original_data.origin,
                     referer=original_data.referer,
-                    src=is_playlist,  # True for .m3u8, False for .ts and other segments
+                    src=False,  # Segments should not be rewritten further
                 )
 
                 # Encode the proxy data
@@ -133,6 +130,9 @@ def rewrite_m3u8_urls(content: str, original_data: ProxyData, current_url: str) 
                     .decode("utf-8")
                     .rstrip("=")
                 )
+
+                # Determine if this is a playlist (for extension hint)
+                is_playlist = ".m3u8" in absolute_url.lower()
 
                 # Build proxied URL
                 proxied_url = f"{server_origin}/url/{base64_encoded}"
@@ -174,7 +174,7 @@ def decode_proxy_data(base64_data: str) -> ProxyData:
 
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON in proxy data: {e}")
-    except binascii.Error as e:
+    except base64.binascii.Error as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64 encoding: {e}")
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=f"Invalid proxy data format: {e}")
@@ -204,19 +204,26 @@ def determine_content_type(url: str, response_content_type: str) -> str:
 
 @app.get("/url/{base64_data:path}")
 async def m3u8_proxy(base64_data: str, request: Request):
+    """
+    Main proxy endpoint. Decodes base64 URL, fetches content,
+    and optionally rewrites M3U8 playlists.
+    """
     # Decode and validate proxy data
     proxy_data = decode_proxy_data(base64_data)
 
-    cache_key = base64_data  # Use base64_data as unique cache key
+    # Use base64_data as cache key
+    cache_key = base64_data
 
     # Check cache first
     cached_value = cache.get(cache_key)
     if cached_value is not None:
-        content, content_type, headers = cached_value
-        return Response(content=content, media_type=content_type, headers=headers)
+        content, content_type, response_headers = cached_value
+        return Response(
+            content=content, media_type=content_type, headers=response_headers
+        )
 
     # Build headers for upstream request
-    headers = {
+    request_headers = {
         "User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:143.0) Gecko/20100101 Firefox/143.0",
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.5",
@@ -227,15 +234,16 @@ async def m3u8_proxy(base64_data: str, request: Request):
     }
 
     if proxy_data.origin:
-        headers["Origin"] = proxy_data.origin
+        request_headers["Origin"] = proxy_data.origin
     if proxy_data.referer:
-        headers["Referer"] = proxy_data.referer
+        request_headers["Referer"] = proxy_data.referer
 
+    # Fetch upstream content
     async with httpx.AsyncClient(
         http2=True, follow_redirects=True, timeout=30.0
     ) as client:
         try:
-            response = await client.get(proxy_data.url, headers=headers)
+            response = await client.get(proxy_data.url, headers=request_headers)
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
             raise HTTPException(
@@ -249,45 +257,48 @@ async def m3u8_proxy(base64_data: str, request: Request):
                 status_code=502, detail=f"Upstream request failed: {str(e)}"
             )
 
-    # Determine content type
+    # Determine content type first
     content_type = determine_content_type(
         proxy_data.url, response.headers.get("content-type", "")
     )
 
+    # Check if this is an M3U8 playlist that needs rewriting
     is_m3u8 = (
         ".m3u8" in proxy_data.url.lower()
         or content_type == "application/vnd.apple.mpegurl"
     )
     will_modify = proxy_data.src and is_m3u8
 
+    # Get content - use text ONLY for M3U8 that will be rewritten, binary for everything else
     if will_modify:
         content = response.text
         content = rewrite_m3u8_urls(content, proxy_data, str(request.url))
-        content_bytes = content.encode("utf-8")
     else:
-        content_bytes = response.content
+        # Keep as binary for all media segments (TS, MP4, etc.)
+        content = response.content
 
+    # Build response headers
     response_headers = {
         "Cache-Control": "public, max-age=3600",
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Expose-Headers": "*",
     }
 
+    # Only preserve upstream headers if content wasn't modified
     if not will_modify:
         for header in ["Content-Length", "Last-Modified", "ETag"]:
             if header in response.headers:
                 response_headers[header] = response.headers[header]
 
-    # Cache the response content, content type, and headers as a tuple
-    cache.set(cache_key, (content_bytes, content_type, response_headers))
+    # Cache the response (content, content_type, headers)
+    cache.set(cache_key, (content, content_type, response_headers))
 
-    return Response(
-        content=content_bytes, media_type=content_type, headers=response_headers
-    )
+    return Response(content=content, media_type=content_type, headers=response_headers)
 
 
 @app.get("/")
 def read_root():
+    """Health check endpoint"""
     return {
         "status": "online",
         "service": "M3U8 Proxy Server",
@@ -298,4 +309,5 @@ def read_root():
 
 @app.get("/health")
 def health_check():
+    """Health check for monitoring"""
     return {"status": "healthy"}
