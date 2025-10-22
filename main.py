@@ -7,8 +7,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ValidationError
-from diskcache import Cache
+from pydantic import BaseModel, HttpUrl, ValidationError
 
 app = FastAPI(
     title="M3U8 Proxy Server",
@@ -23,13 +22,6 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-)
-
-# Create a disk cache with LRU eviction and 400MB size limit
-cache = Cache(
-    "/tmp/m3u8_cache",
-    size_limit=400 * 1024 * 1024,  # 400 MB
-    eviction_policy="least-recently-used",
 )
 
 
@@ -211,19 +203,8 @@ async def m3u8_proxy(base64_data: str, request: Request):
     # Decode and validate proxy data
     proxy_data = decode_proxy_data(base64_data)
 
-    # Use base64_data as cache key
-    cache_key = base64_data
-
-    # Check cache first
-    cached_value = cache.get(cache_key)
-    if cached_value is not None:
-        content, content_type, response_headers = cached_value
-        return Response(
-            content=content, media_type=content_type, headers=response_headers
-        )
-
-    # Build headers for upstream request
-    request_headers = {
+    # Build headers
+    headers = {
         "User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:143.0) Gecko/20100101 Firefox/143.0",
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.5",
@@ -234,16 +215,16 @@ async def m3u8_proxy(base64_data: str, request: Request):
     }
 
     if proxy_data.origin:
-        request_headers["Origin"] = proxy_data.origin
+        headers["Origin"] = proxy_data.origin
     if proxy_data.referer:
-        request_headers["Referer"] = proxy_data.referer
+        headers["Referer"] = proxy_data.referer
 
     # Fetch upstream content
     async with httpx.AsyncClient(
         http2=True, follow_redirects=True, timeout=30.0
     ) as client:
         try:
-            response = await client.get(proxy_data.url, headers=request_headers)
+            response = await client.get(proxy_data.url, headers=headers)
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
             raise HTTPException(
@@ -289,9 +270,6 @@ async def m3u8_proxy(base64_data: str, request: Request):
         for header in ["Content-Length", "Last-Modified", "ETag"]:
             if header in response.headers:
                 response_headers[header] = response.headers[header]
-
-    # Cache the response (content, content_type, headers)
-    cache.set(cache_key, (content, content_type, response_headers))
 
     return Response(content=content, media_type=content_type, headers=response_headers)
 
