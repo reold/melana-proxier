@@ -32,7 +32,7 @@ app.add_middleware(
 # Create a disk cache with LRU eviction and 400MB size limit
 cache = Cache(
     "/tmp/m3u8_cache",
-    size_limit=cache_size_bytes
+    size_limit=cache_size_bytes,
     eviction_policy="least-recently-used",
 )
 
