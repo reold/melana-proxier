@@ -9,12 +9,16 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ValidationError
 from diskcache import Cache
+import os
 
 app = FastAPI(
     title="M3U8 Proxy Server",
     description="A FastAPI server to proxy and rewrite M3U8 playlists.",
     version="2.0.0",
 )
+
+cache_size_gb = float(os.getenv("CACHE_SIZE", "0.4"))  # Default to 0.4 GB if not set
+cache_size_bytes = int(cache_size_gb * 1024 * 1024 * 1024)  # Convert GB to bytes
 
 # Configure CORS
 app.add_middleware(
@@ -28,7 +32,7 @@ app.add_middleware(
 # Create a disk cache with LRU eviction and 400MB size limit
 cache = Cache(
     "/tmp/m3u8_cache",
-    size_limit=400 * 1024 * 1024,  # 400 MB
+    size_limit=cache_size_bytes
     eviction_policy="least-recently-used",
 )
 
