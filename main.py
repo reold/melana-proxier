@@ -313,23 +313,32 @@ async def m3u8_proxy(base64_data: str, request: Request):
     )
     will_modify = proxy_data.src and is_m3u8
 
-    # Get content - use text ONLY for M3U8 that will be rewritten, binary for everything else
-    if will_modify:
-        content = response.text
-        content = rewrite_m3u8_urls(content, proxy_data, str(request.url))
-    else:
-        # Keep as binary for all media segments (TS, MP4, etc.)
-        content = response.content
-
     # Build response headers
     response_headers = {
-        "Cache-Control": "public, max-age=3600",
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Expose-Headers": "*",
     }
 
-    # Only preserve upstream headers if content wasn't modified
-    if not will_modify:
+    is_live_playlist = False
+
+    # Get content - use text ONLY for M3U8 that will be rewritten, binary for everything else
+    if will_modify:
+        content = response.text
+        content = rewrite_m3u8_urls(content, proxy_data, str(request.url))
+
+        # FIX: Check if this is a Live Stream vs VOD.
+        # If it doesn't have an ENDLIST tag, it's live and updates frequently.
+        if "#EXT-X-ENDLIST" not in content:
+            is_live_playlist = True
+            response_headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        else:
+            response_headers["Cache-Control"] = "public, max-age=3600"
+    else:
+        # Keep as binary for all media segments (TS, MP4, etc.)
+        content = response.content
+        response_headers["Cache-Control"] = "public, max-age=3600"
+
+        # Only preserve upstream headers if content wasn't modified
         for header in ["Content-Length", "Last-Modified", "ETag"]:
             if header in response.headers:
                 response_headers[header] = response.headers[header]
