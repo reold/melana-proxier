@@ -1,3 +1,7 @@
+# manual entries
+demo.py
+cache.db
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
