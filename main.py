@@ -1,4 +1,5 @@
 import base64
+import binascii
 import json
 import re
 from typing import Optional
@@ -178,7 +179,7 @@ def decode_proxy_data(base64_data: str) -> ProxyData:
 
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON in proxy data: {e}")
-    except base64.binascii.Error as e:
+    except binascii.Error as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64 encoding: {e}")
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=f"Invalid proxy data format: {e}")
