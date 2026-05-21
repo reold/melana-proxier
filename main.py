@@ -2,20 +2,38 @@ import base64
 import binascii
 import json
 import re
+import os
 from typing import Optional
 from urllib.parse import urljoin, urlparse
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ValidationError
 from diskcache import Cache
-import os
+
+# ---------------------------------------------------------
+# FIX: Global HTTP Client for connection pooling
+# Recreating httpx.AsyncClient per request exhausts sockets.
+# This lifespan manager keeps one client alive for all requests.
+# ---------------------------------------------------------
+http_client: httpx.AsyncClient = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client
+    http_client = httpx.AsyncClient(http2=True, follow_redirects=True, timeout=30.0)
+    yield
+    await http_client.aclose()
+
 
 app = FastAPI(
     title="M3U8 Proxy Server",
     description="A FastAPI server to proxy and rewrite M3U8 playlists.",
     version="2.0.0",
+    lifespan=lifespan,  # Attach the lifespan event here
 )
 
 cache_size_gb = float(os.getenv("CACHE_SIZE", "0.4"))  # Default to 0.4 GB if not set
@@ -243,24 +261,21 @@ async def m3u8_proxy(base64_data: str, request: Request):
     if proxy_data.referer:
         request_headers["Referer"] = proxy_data.referer
 
-    # Fetch upstream content
-    async with httpx.AsyncClient(
-        http2=True, follow_redirects=True, timeout=30.0
-    ) as client:
-        try:
-            response = await client.get(proxy_data.url, headers=request_headers)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(
-                status_code=e.response.status_code,
-                detail=f"Upstream returned {e.response.status_code}: {e.response.text[:200]}",
-            )
-        except httpx.TimeoutException:
-            raise HTTPException(status_code=504, detail="Upstream request timed out")
-        except httpx.RequestError as e:
-            raise HTTPException(
-                status_code=502, detail=f"Upstream request failed: {str(e)}"
-            )
+    # Fetch upstream content (Using the global http_client)
+    try:
+        response = await http_client.get(proxy_data.url, headers=request_headers)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"Upstream returned {e.response.status_code}: {e.response.text[:200]}",
+        )
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Upstream request timed out")
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=502, detail=f"Upstream request failed: {str(e)}"
+        )
 
     # Determine content type first
     content_type = determine_content_type(
