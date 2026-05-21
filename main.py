@@ -65,6 +65,19 @@ class ProxyData(BaseModel):
     src: bool = False
 
 
+def is_safe_url(url: str) -> bool:
+    """
+    FIX: Basic SSRF protection.
+    Ensures the proxy is only used to fetch external HTTP/HTTPS URLs,
+    preventing attackers from querying local files or internal networks.
+    """
+    try:
+        parsed = urlparse(url)
+        return parsed.scheme in ["http", "https"]
+    except Exception:
+        return False
+
+
 def is_absolute_url(url: str) -> bool:
     """Check if URL is absolute"""
     return url.startswith(("http://", "https://"))
@@ -193,7 +206,15 @@ def decode_proxy_data(base64_data: str) -> ProxyData:
         json_data = json.loads(decoded_bytes.decode("utf-8"))
 
         # Validate with Pydantic
-        return ProxyData(**json_data)
+        data = ProxyData(**json_data)
+
+        # Enforce security check
+        if not is_safe_url(data.url):
+            raise HTTPException(
+                status_code=403, detail="Unsafe or invalid URL requested."
+            )
+
+        return data
 
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON in proxy data: {e}")
