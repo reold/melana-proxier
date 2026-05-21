@@ -346,16 +346,31 @@ async def m3u8_proxy(base64_data: str, request: Request):
 
 @app.get("/")
 def read_root():
-    """Health check endpoint"""
+    """Health check and cache statistics endpoint"""
+    # Safely gather cache metrics
+    try:
+        num_entries = len(cache)
+        current_bytes = cache.volume()  # Total size of cache directory in bytes
+    except Exception:
+        num_entries = -1
+        current_bytes = -1
+
+    size_limit = cache.size_limit  # 0 means no limit
+    if size_limit > 0:
+        utilization = round((current_bytes / size_limit) * 100, 2)
+    else:
+        utilization = None
+
     return {
         "status": "online",
         "service": "M3U8 Proxy Server",
         "version": "2.0.0",
         "endpoint": "/url/<base64_data>",
+        "cache": {
+            "entries": num_entries,
+            "current_bytes": current_bytes,
+            "max_bytes": size_limit,
+            "max_gb": cache_size_gb,
+            "utilization_percent": utilization,
+        },
     }
-
-
-@app.get("/health")
-def health_check():
-    """Health check for monitoring"""
-    return {"status": "healthy"}
