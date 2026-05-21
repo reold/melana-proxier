@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ValidationError
 from diskcache import Cache
 
@@ -260,8 +261,8 @@ async def m3u8_proxy(base64_data: str, request: Request):
     # Use base64_data as cache key
     cache_key = base64_data[:-5] if base64_data.endswith(".m3u8") else base64_data
 
-    # Check cache first
-    cached_value = cache.get(cache_key)
+    # Check cache first (Wrapped in threadpool because diskcache is blocking)
+    cached_value = await run_in_threadpool(cache.get, cache_key)
     if cached_value is not None:
         content, content_type, response_headers = cached_value
         return Response(
@@ -334,7 +335,11 @@ async def m3u8_proxy(base64_data: str, request: Request):
                 response_headers[header] = response.headers[header]
 
     # Cache the response (content, content_type, headers)
-    cache.set(cache_key, (content, content_type, response_headers))
+    # We do NOT cache live playlists to prevent the video player from getting stuck
+    if not is_live_playlist:
+        await run_in_threadpool(
+            cache.set, cache_key, (content, content_type, response_headers)
+        )
 
     return Response(content=content, media_type=content_type, headers=response_headers)
 
