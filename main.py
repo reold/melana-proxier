@@ -217,7 +217,7 @@ async def m3u8_proxy(base64_data: str, request: Request):
     proxy_data = decode_proxy_data(base64_data)
 
     # Use base64_data as cache key
-    cache_key = base64_data
+    cache_key = base64_data[:-5] if base64_data.endswith(".m3u8") else base64_data
 
     # Check cache first
     cached_value = cache.get(cache_key)
