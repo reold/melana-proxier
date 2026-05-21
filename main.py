@@ -149,12 +149,17 @@ def rewrite_m3u8_urls(content: str, original_data: ProxyData, current_url: str) 
                 # Resolve to absolute URL
                 absolute_url = resolve_url(base_url, stripped)
 
+                # Determine if this is a playlist (for extension hint)
+                is_playlist = ".m3u8" in absolute_url.lower()
+
                 # Create new proxy configuration
                 new_proxy_data = ProxyData(
                     url=absolute_url,
                     origin=original_data.origin,
                     referer=original_data.referer,
-                    src=False,  # Segments should not be rewritten further
+                    # FIX: Allow recursive rewriting if the segment is actually
+                    # another playlist (e.g., Master Playlist -> Media Playlist).
+                    src=is_playlist,
                 )
 
                 # Encode the proxy data
@@ -166,9 +171,6 @@ def rewrite_m3u8_urls(content: str, original_data: ProxyData, current_url: str) 
                     .decode("utf-8")
                     .rstrip("=")
                 )
-
-                # Determine if this is a playlist (for extension hint)
-                is_playlist = ".m3u8" in absolute_url.lower()
 
                 # Build proxied URL
                 proxied_url = f"{server_origin}/url/{base64_encoded}"
