@@ -1,46 +1,68 @@
+import asyncio
 import base64
 import binascii
+import hashlib
 import json
-import re
 import os
+import re
+from contextlib import asynccontextmanager
 from typing import Optional
 from urllib.parse import urljoin, urlparse
-from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, ValidationError
 from diskcache import Cache
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, ValidationError
 
-# ---------------------------------------------------------
-# FIX: Global HTTP Client for connection pooling
-# Recreating httpx.AsyncClient per request exhausts sockets.
-# This lifespan manager keeps one client alive for all requests.
-# ---------------------------------------------------------
-http_client: httpx.AsyncClient = None
+M3U8_CONTENT_TYPES = {
+    "application/vnd.apple.mpegurl",
+    "application/x-mpegurl",
+    "audio/mpegurl",
+    "audio/x-mpegurl",
+}
+
+URI_ATTR_RE = re.compile(r'URI="([^"]+)"')
+
+http_client: Optional[httpx.AsyncClient] = None
+
+# Per-process single-flight map:
+# one upstream fetch per cache key at a time
+inflight_requests: dict[str, asyncio.Task] = {}
+inflight_lock = asyncio.Lock()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
-    http_client = httpx.AsyncClient(http2=True, follow_redirects=True, timeout=30.0)
+
+    http_client = httpx.AsyncClient(
+        http2=True,
+        follow_redirects=True,
+        timeout=30.0,
+        limits=httpx.Limits(
+            max_connections=500,
+            max_keepalive_connections=100,
+        ),
+    )
+
     yield
+
     await http_client.aclose()
 
 
 app = FastAPI(
     title="M3U8 Proxy Server",
     description="A FastAPI server to proxy and rewrite M3U8 playlists.",
-    version="2.0.0",
-    lifespan=lifespan,  # Attach the lifespan event here
+    version="2.1.0",
+    lifespan=lifespan,
 )
 
-cache_size_gb = float(os.getenv("CACHE_SIZE", "0.4"))  # Default to 0.4 GB if not set
-cache_size_bytes = int(cache_size_gb * 1024 * 1024 * 1024)  # Convert GB to bytes
+cache_size_gb = float(os.getenv("CACHE_SIZE", "0.4"))
+cache_size_bytes = int(cache_size_gb * 1024 * 1024 * 1024)
+cache_dir = os.getenv("CACHE_DIR", "/tmp/m3u8_cache")
 
-# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -49,169 +71,177 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Create a disk cache with LRU eviction and 400MB size limit
 cache = Cache(
-    "/tmp/m3u8_cache",
+    cache_dir,
     size_limit=cache_size_bytes,
     eviction_policy="least-recently-used",
 )
 
 
 class ProxyData(BaseModel):
-    """Data model for proxy configuration"""
-
     url: str
     origin: Optional[str] = None
     referer: Optional[str] = None
     src: bool = False
 
 
+def model_to_dict(model: BaseModel) -> dict:
+    if hasattr(model, "model_dump"):
+        return model.model_dump(exclude_none=True)
+    return model.dict(exclude_none=True)
+
+
 def is_safe_url(url: str) -> bool:
-    """
-    FIX: Basic SSRF protection.
-    Ensures the proxy is only used to fetch external HTTP/HTTPS URLs,
-    preventing attackers from querying local files or internal networks.
-    """
     try:
         parsed = urlparse(url)
-        return parsed.scheme in ["http", "https"]
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
     except Exception:
         return False
 
 
 def is_absolute_url(url: str) -> bool:
-    """Check if URL is absolute"""
     return url.startswith(("http://", "https://"))
 
 
-def is_likely_media_url(line: str) -> bool:
-    """
-    Determine if a line is likely a media URL or segment.
-    Checks for common media file extensions and URL patterns.
-    """
-    if not line or line.startswith("#"):
-        return False
-
-    # Check for absolute or relative URLs
-    if line.startswith(("http://", "https://", "/")):
-        return True
-
-    # Check for common media file extensions
-    media_extensions = r"\.(ts|m3u8|m4s|mp4|key|aac|mp3|vtt|webvtt)(\?.*)?$"
-    return re.search(media_extensions, line, re.IGNORECASE) is not None
-
-
 def resolve_url(base_url: str, relative_url: str) -> str:
-    """
-    Safely resolve a relative URL against a base URL.
-    Handles edge cases and malformed URLs.
-    """
     try:
-        # If already absolute, return as-is
         if is_absolute_url(relative_url):
             return relative_url
 
-        # Use httpx.URL for robust URL handling
         base = httpx.URL(base_url)
-        resolved = base.join(relative_url)
-        return str(resolved)
+        return str(base.join(relative_url))
     except Exception:
-        # Fallback to urljoin
         return urljoin(base_url, relative_url)
 
 
+def determine_content_type(url: str, response_content_type: str) -> str:
+    url_lower = url.lower()
+    upstream_ct = (response_content_type or "").split(";", 1)[0].strip().lower()
+
+    if ".m3u8" in url_lower:
+        return "application/vnd.apple.mpegurl"
+    if ".ts" in url_lower:
+        return "video/mp2t"
+    if ".mp4" in url_lower:
+        return "video/mp4"
+    if ".webvtt" in url_lower or ".vtt" in url_lower:
+        return "text/vtt"
+    if ".m4s" in url_lower:
+        return "video/iso.segment"
+
+    if upstream_ct:
+        return upstream_ct
+
+    return "application/octet-stream"
+
+
+def build_cache_key(data: ProxyData) -> str:
+    canonical = json.dumps(
+        {
+            "url": data.url,
+            "origin": data.origin,
+            "referer": data.referer,
+            "src": data.src,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def encode_proxy_data(data: ProxyData) -> str:
+    payload = json.dumps(
+        model_to_dict(data),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("utf-8").rstrip("=")
+
+
+def build_proxied_url(
+    absolute_url: str, original_data: ProxyData, server_origin: str
+) -> str:
+    is_playlist = ".m3u8" in absolute_url.lower()
+
+    new_proxy_data = ProxyData(
+        url=absolute_url,
+        origin=original_data.origin,
+        referer=original_data.referer,
+        src=is_playlist,
+    )
+
+    encoded = encode_proxy_data(new_proxy_data)
+    proxied_url = f"{server_origin}/url/{encoded}"
+
+    if is_playlist:
+        proxied_url += ".m3u8"
+
+    return proxied_url
+
+
+def rewrite_uri_attributes(
+    line: str, base_url: str, original_data: ProxyData, server_origin: str
+) -> str:
+    def _replace(match: re.Match) -> str:
+        raw_uri = match.group(1)
+        absolute_url = resolve_url(base_url, raw_uri)
+        proxied_url = build_proxied_url(absolute_url, original_data, server_origin)
+        return f'URI="{proxied_url}"'
+
+    return URI_ATTR_RE.sub(_replace, line)
+
+
 def rewrite_m3u8_urls(content: str, original_data: ProxyData, current_url: str) -> str:
-    """
-    Rewrites URLs inside an M3U8 playlist to point back to this proxy.
-    Handles both master playlists and media playlists.
-    """
     try:
         parsed_current = urlparse(current_url)
         server_origin = f"{parsed_current.scheme}://{parsed_current.netloc}"
     except Exception:
-        # Fallback
         server_origin = "/".join(str(current_url).split("/")[:3])
 
     base_url = original_data.url
-    lines = content.split("\n")
+    lines = content.splitlines()
     rewritten_lines = []
 
     for line in lines:
         stripped = line.strip()
 
-        # Pass through comments and empty lines
-        if not stripped or stripped.startswith("#"):
+        if not stripped:
             rewritten_lines.append(line)
             continue
 
-        # Check if this line contains a URL
-        if is_likely_media_url(stripped):
-            try:
-                # Resolve to absolute URL
-                absolute_url = resolve_url(base_url, stripped)
+        # Rewrite URI="..." attributes in playlist tags like:
+        # #EXT-X-KEY, #EXT-X-MAP, #EXT-X-MEDIA, #EXT-X-I-FRAME-STREAM-INF, etc.
+        if stripped.startswith("#"):
+            rewritten_lines.append(
+                rewrite_uri_attributes(line, base_url, original_data, server_origin)
+            )
+            continue
 
-                # Determine if this is a playlist (for extension hint)
-                is_playlist = ".m3u8" in absolute_url.lower()
-
-                # Create new proxy configuration
-                new_proxy_data = ProxyData(
-                    url=absolute_url,
-                    origin=original_data.origin,
-                    referer=original_data.referer,
-                    # FIX: Allow recursive rewriting if the segment is actually
-                    # another playlist (e.g., Master Playlist -> Media Playlist).
-                    src=is_playlist,
-                )
-
-                # Encode the proxy data
-                json_payload = json.dumps(
-                    new_proxy_data.dict(exclude_none=True), separators=(",", ":")
-                )
-                base64_encoded = (
-                    base64.urlsafe_b64encode(json_payload.encode("utf-8"))
-                    .decode("utf-8")
-                    .rstrip("=")
-                )
-
-                # Build proxied URL
-                proxied_url = f"{server_origin}/url/{base64_encoded}"
-                if is_playlist:
-                    proxied_url += ".m3u8"
-
-                rewritten_lines.append(proxied_url)
-            except Exception as e:
-                # Log error but don't break the entire playlist
-                print(f"Error rewriting URL '{stripped}': {e}")
-                rewritten_lines.append(line)
-        else:
-            # Not a URL, pass through unchanged
+        # In HLS playlists, non-comment lines are URI lines
+        try:
+            absolute_url = resolve_url(base_url, stripped)
+            proxied_url = build_proxied_url(absolute_url, original_data, server_origin)
+            rewritten_lines.append(proxied_url)
+        except Exception as e:
+            print(f"Error rewriting URL '{stripped}': {e}")
             rewritten_lines.append(line)
 
-    return "\n".join(rewritten_lines)
+    return "\n".join(rewritten_lines) + ("\n" if content.endswith("\n") else "")
 
 
 def decode_proxy_data(base64_data: str) -> ProxyData:
-    """
-    Decode and validate base64-encoded proxy data.
-    Raises HTTPException on invalid data.
-    """
     try:
-        # Remove optional .m3u8 extension
         if base64_data.endswith(".m3u8"):
             base64_data = base64_data[:-5]
 
-        # Add padding if necessary
         padding_needed = (4 - len(base64_data) % 4) % 4
         base64_data += "=" * padding_needed
 
-        # Decode base64
         decoded_bytes = base64.urlsafe_b64decode(base64_data)
         json_data = json.loads(decoded_bytes.decode("utf-8"))
 
-        # Validate with Pydantic
         data = ProxyData(**json_data)
 
-        # Enforce security check
         if not is_safe_url(data.url):
             raise HTTPException(
                 status_code=403, detail="Unsafe or invalid URL requested."
@@ -219,6 +249,8 @@ def decode_proxy_data(base64_data: str) -> ProxyData:
 
         return data
 
+    except HTTPException:
+        raise
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON in proxy data: {e}")
     except binascii.Error as e:
@@ -227,51 +259,15 @@ def decode_proxy_data(base64_data: str) -> ProxyData:
         raise HTTPException(status_code=400, detail=f"Invalid proxy data format: {e}")
 
 
-def determine_content_type(url: str, response_content_type: str) -> str:
-    """
-    Determine the appropriate content type based on URL and upstream response.
-    """
-    url_lower = url.lower()
+async def fetch_upstream_result(proxy_data: ProxyData, request: Request):
+    if http_client is None:
+        raise HTTPException(status_code=503, detail="HTTP client not initialized")
 
-    # Check URL extension first
-    if ".m3u8" in url_lower:
-        return "application/vnd.apple.mpegurl"
-    elif ".ts" in url_lower:
-        return "video/mp2t"
-    elif ".mp4" in url_lower:
-        return "video/mp4"
-    elif ".webvtt" in url_lower or ".vtt" in url_lower:
-        return "text/vtt"
-    elif ".m4s" in url_lower:
-        return "video/iso.segment"
-
-    # Fall back to upstream content type
-    return response_content_type or "application/octet-stream"
-
-
-@app.get("/url/{base64_data:path}")
-async def m3u8_proxy(base64_data: str, request: Request):
-    """
-    Main proxy endpoint. Decodes base64 URL, fetches content,
-    and optionally rewrites M3U8 playlists.
-    """
-    # Decode and validate proxy data
-    proxy_data = decode_proxy_data(base64_data)
-
-    # Use base64_data as cache key
-    cache_key = base64_data[:-5] if base64_data.endswith(".m3u8") else base64_data
-
-    # Check cache first (Wrapped in threadpool because diskcache is blocking)
-    cached_value = await run_in_threadpool(cache.get, cache_key)
-    if cached_value is not None:
-        content, content_type, response_headers = cached_value
-        return Response(
-            content=content, media_type=content_type, headers=response_headers
-        )
-
-    # Build headers for upstream request
     request_headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:143.0) Gecko/20100101 Firefox/143.0",
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:143.0) "
+            "Gecko/20100101 Firefox/143.0"
+        ),
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.5",
         "Connection": "keep-alive",
@@ -285,10 +281,9 @@ async def m3u8_proxy(base64_data: str, request: Request):
     if proxy_data.referer:
         request_headers["Referer"] = proxy_data.referer
 
-    # Fetch upstream content (Using the global http_client)
     try:
-        response = await http_client.get(proxy_data.url, headers=request_headers)
-        response.raise_for_status()
+        upstream = await http_client.get(proxy_data.url, headers=request_headers)
+        upstream.raise_for_status()
     except httpx.HTTPStatusError as e:
         raise HTTPException(
             status_code=e.response.status_code,
@@ -301,71 +296,118 @@ async def m3u8_proxy(base64_data: str, request: Request):
             status_code=502, detail=f"Upstream request failed: {str(e)}"
         )
 
-    # Determine content type first
     content_type = determine_content_type(
-        proxy_data.url, response.headers.get("content-type", "")
+        proxy_data.url,
+        upstream.headers.get("content-type", ""),
     )
 
-    # Check if this is an M3U8 playlist that needs rewriting
-    is_m3u8 = (
-        ".m3u8" in proxy_data.url.lower()
-        or content_type == "application/vnd.apple.mpegurl"
-    )
+    is_m3u8 = ".m3u8" in proxy_data.url.lower() or content_type in M3U8_CONTENT_TYPES
+
     will_modify = proxy_data.src and is_m3u8
+    is_live_playlist = False
 
-    # Build response headers
     response_headers = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Expose-Headers": "*",
     }
 
-    is_live_playlist = False
+    if is_m3u8:
+        content = upstream.text
 
-    # Get content - use text ONLY for M3U8 that will be rewritten, binary for everything else
-    if will_modify:
-        content = response.text
-        content = rewrite_m3u8_urls(content, proxy_data, str(request.url))
+        if will_modify:
+            content = rewrite_m3u8_urls(content, proxy_data, str(request.url))
 
-        # FIX: Check if this is a Live Stream vs VOD.
-        # If it doesn't have an ENDLIST tag, it's live and updates frequently.
+        # No ENDLIST usually means live/event playlist
         if "#EXT-X-ENDLIST" not in content:
             is_live_playlist = True
             response_headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         else:
             response_headers["Cache-Control"] = "public, max-age=3600"
+
     else:
-        # Keep as binary for all media segments (TS, MP4, etc.)
-        content = response.content
-        response_headers["Cache-Control"] = "public, max-age=3600"
+        content = upstream.content
+        response_headers["Cache-Control"] = "public, max-age=3600, immutable"
 
-        # Only preserve upstream headers if content wasn't modified
-        for header in ["Content-Length", "Last-Modified", "ETag"]:
-            if header in response.headers:
-                response_headers[header] = response.headers[header]
+    # Preserve safe upstream headers only when content was not modified
+    if not will_modify:
+        for header in ("Last-Modified", "ETag", "Accept-Ranges"):
+            if header in upstream.headers:
+                response_headers[header] = upstream.headers[header]
 
-    # Cache the response (content, content_type, headers)
-    # We do NOT cache live playlists to prevent the video player from getting stuck
+    result = (content, content_type, response_headers)
+    return result, is_live_playlist
+
+
+async def fetch_cache_and_store(
+    cache_key: str, proxy_data: ProxyData, request: Request
+):
+    result, is_live_playlist = await fetch_upstream_result(proxy_data, request)
+
+    # Do not cache live playlists
     if not is_live_playlist:
-        await run_in_threadpool(
-            cache.set, cache_key, (content, content_type, response_headers)
-        )
+        await run_in_threadpool(cache.set, cache_key, result)
 
-    return Response(content=content, media_type=content_type, headers=response_headers)
+    return result
+
+
+async def get_or_build_response(
+    cache_key: str, proxy_data: ProxyData, request: Request
+):
+    # Fast path
+    cached_value = await run_in_threadpool(cache.get, cache_key)
+    if cached_value is not None:
+        return cached_value
+
+    # Slow path: coalesce concurrent cache misses
+    async with inflight_lock:
+        # Double-check after taking the lock
+        cached_value = await run_in_threadpool(cache.get, cache_key)
+        if cached_value is not None:
+            return cached_value
+
+        task = inflight_requests.get(cache_key)
+        if task is None:
+            task = asyncio.create_task(
+                fetch_cache_and_store(cache_key, proxy_data, request)
+            )
+            inflight_requests[cache_key] = task
+
+    try:
+        return await task
+    finally:
+        if task.done():
+            async with inflight_lock:
+                if inflight_requests.get(cache_key) is task:
+                    inflight_requests.pop(cache_key, None)
+
+
+@app.get("/url/{base64_data:path}")
+async def m3u8_proxy(base64_data: str, request: Request):
+    proxy_data = decode_proxy_data(base64_data)
+    cache_key = build_cache_key(proxy_data)
+
+    content, content_type, response_headers = await get_or_build_response(
+        cache_key, proxy_data, request
+    )
+
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers=response_headers,
+    )
 
 
 @app.get("/")
 def read_root():
-    """Health check and cache statistics endpoint"""
-    # Safely gather cache metrics
     try:
         num_entries = len(cache)
-        current_bytes = cache.volume()  # Total size of cache directory in bytes
+        current_bytes = cache.volume()
     except Exception:
         num_entries = -1
         current_bytes = -1
 
-    size_limit = cache.size_limit  # 0 means no limit
-    if size_limit > 0:
+    size_limit = cache.size_limit
+    if size_limit > 0 and current_bytes >= 0:
         utilization = round((current_bytes / size_limit) * 100, 2)
     else:
         utilization = None
@@ -373,7 +415,7 @@ def read_root():
     return {
         "status": "online",
         "service": "M3U8 Proxy Server",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "endpoint": "/url/<base64_data>",
         "cache": {
             "entries": num_entries,
