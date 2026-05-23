@@ -441,6 +441,7 @@ def build_upstream_headers(
             "Gecko/20100101 Firefox/143.0"
         ),
         "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate, br",
         "Accept-Language": "en-US,en;q=0.5",
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
@@ -452,8 +453,12 @@ def build_upstream_headers(
     if proxy_data.origin:
         headers["Origin"] = proxy_data.origin
 
+    # Many CDNs require a Referer header to authorize the request.
+    # When the client sends `origin` but not `referer`, derive it.
     if proxy_data.referer:
         headers["Referer"] = proxy_data.referer
+    elif proxy_data.origin:
+        headers["Referer"] = proxy_data.origin.rstrip("/") + "/"
 
     if request is not None:
         # Critical conditional/range headers.
@@ -476,13 +481,14 @@ async def safe_get(url: str, headers: dict) -> httpx.Response:
         raise HTTPException(status_code=503, detail="HTTP client not initialized")
 
     current_url = url
+    current_headers = dict(headers)
 
     for _ in range(MAX_REDIRECTS + 1):
         await assert_safe_url(current_url)
 
         response = await http_client.get(
             current_url,
-            headers=headers,
+            headers=current_headers,
             follow_redirects=False,
         )
 
@@ -492,6 +498,8 @@ async def safe_get(url: str, headers: dict) -> httpx.Response:
             if not location:
                 return response
 
+            # Update Referer to the redirecting URL (real-browser behavior).
+            current_headers["Referer"] = current_url
             current_url = resolve_url(current_url, location)
             await response.aclose()
             continue
@@ -506,6 +514,7 @@ async def safe_stream_get(url: str, headers: dict) -> httpx.Response:
         raise HTTPException(status_code=503, detail="HTTP client not initialized")
 
     current_url = url
+    current_headers = dict(headers)
 
     for _ in range(MAX_REDIRECTS + 1):
         await assert_safe_url(current_url)
@@ -513,7 +522,7 @@ async def safe_stream_get(url: str, headers: dict) -> httpx.Response:
         req = http_client.build_request(
             "GET",
             current_url,
-            headers=headers,
+            headers=current_headers,
         )
 
         response = await http_client.send(
@@ -529,6 +538,7 @@ async def safe_stream_get(url: str, headers: dict) -> httpx.Response:
                 return response
 
             await response.aclose()
+            current_headers["Referer"] = current_url
             current_url = resolve_url(current_url, location)
             continue
 
@@ -883,18 +893,18 @@ async def media_flight_body(flight: MediaFlight):
                 lambda: index < len(flight.chunks) or flight.done or flight.error
             )
 
-            if index < len(flight.chunks):
-                chunk = flight.chunks[index]
-                index += 1
+        if index < len(flight.chunks):
+            chunk = flight.chunks[index]
+            index += 1
 
-            elif flight.error:
-                raise flight.error
+        elif flight.error:
+            raise flight.error
 
-            elif flight.done:
-                break
+        elif flight.done:
+            break
 
-            else:
-                continue
+        else:
+            continue
 
         yield chunk
 
