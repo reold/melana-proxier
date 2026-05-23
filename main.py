@@ -384,11 +384,7 @@ def decode_proxy_data(base64_data: str) -> ProxyData:
         base64_data += "=" * padding_needed
 
         # validate=True already rejects any non-base64 characters with binascii.Error
-        decoded_bytes = base64.b64decode(
-            base64_data,
-            altchars=b"-_",
-            validate=True,
-        )
+        decoded_bytes = base64.urlsafe_b64decode(base64_data)
         json_data = json.loads(decoded_bytes.decode("utf-8"))
         data = ProxyData(**json_data)
 
