@@ -388,15 +388,32 @@ def rewrite_m3u8_urls(
 
 def decode_proxy_data(base64_data: str) -> ProxyData:
     try:
+        # 1. Strip the playlist suffix we append in build_proxied_url()
         if base64_data.endswith(".m3u8"):
             base64_data = base64_data[:-5]
 
+        # 2. Strip trailing slashes / whitespace that CDNs, redirects, or players append
+        base64_data = base64_data.rstrip("/ \t\r\n")
+
+        # 3. Strict alphabet check: A–Z, a–z, 0–9, -, _
+        if not re.fullmatch(r"[A-Za-z0-9\-_]+", base64_data):
+            raise HTTPException(
+                status_code=400,
+                detail="Proxy data contains invalid characters.",
+            )
+
+        # 4. Restore padding
         padding_needed = (4 - len(base64_data) % 4) % 4
         base64_data += "=" * padding_needed
 
-        decoded_bytes = base64.urlsafe_b64decode(base64_data)
-        json_data = json.loads(decoded_bytes.decode("utf-8"))
+        # 5. Decode with validation so non-alphabet chars are rejected
+        decoded_bytes = base64.b64decode(
+            base64_data,
+            altchars=b"-_",
+            validate=True,
+        )
 
+        json_data = json.loads(decoded_bytes.decode("utf-8"))
         data = ProxyData(**json_data)
 
         if not is_safe_url_syntax(data.url):
@@ -410,11 +427,11 @@ def decode_proxy_data(base64_data: str) -> ProxyData:
     except HTTPException:
         raise
 
+    except (binascii.Error, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 encoding: {e}")
+
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON in proxy data: {e}")
-
-    except binascii.Error as e:
-        raise HTTPException(status_code=400, detail=f"Invalid base64 encoding: {e}")
 
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=f"Invalid proxy data format: {e}")
