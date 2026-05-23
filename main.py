@@ -20,6 +20,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ValidationError
 
 # ── Optional Cloudflare solver ─────────────────────────────────────────
+
 try:
     from curl_cffi import requests as curl_requests
 
@@ -28,6 +29,7 @@ except Exception:
     curl_requests = None  # type: ignore
     CURL_CFFI_AVAILABLE = False
 
+
 M3U8_CONTENT_TYPES = {
     "application/vnd.apple.mpegurl",
     "application/x-mpegurl",
@@ -35,28 +37,37 @@ M3U8_CONTENT_TYPES = {
     "audio/x-mpegurl",
 }
 
+
 URI_ATTR_RE = re.compile(r'URI="([^"]+)"')
 
+
 http_client: Optional[httpx.AsyncClient] = None
+
 
 # Per-process single-flight map for playlist/cacheable non-stream fetches.
 inflight_requests: dict[str, asyncio.Task] = {}
 inflight_lock = asyncio.Lock()
 
+
 # Per-process shared streaming map for media segments.
 inflight_media: dict[str, "MediaFlight"] = {}
 inflight_media_lock = asyncio.Lock()
 
+
 MAX_REDIRECTS = 5
 
+
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
 
 BLOCKED_HOSTNAMES = {
     "localhost",
     "localhost.localdomain",
 }
 
+
 CF_PROBE_URL = os.getenv("CF_PROBE_URL", "").strip() or None
+
 
 CF_HTML_INDICATORS = (
     "cf-browser-verification",
@@ -74,6 +85,7 @@ CF_HTML_INDICATORS = (
 class CFSolver:
     """
     Per-domain single-flight solver.
+
     Solves CF once per domain, harvests cookies into httpx, then gets out of the way.
     """
 
@@ -104,6 +116,7 @@ class CFSolver:
         if not CURL_CFFI_AVAILABLE:
             return
         host = self._host(url)
+
         async with self._master:
             lock = self._domain_locks.get(host)
             if lock is None:
@@ -142,8 +155,8 @@ class CFSolver:
                             domain=getattr(c, "domain", None) or host,
                             path=getattr(c, "path", "/") or "/",
                         )
-                self._domain_solved.add(host)
-                print(f"[CF] Cookies seeded for {host}")
+                    self._domain_solved.add(host)
+                    print(f"[CF] Cookies seeded for {host}")
             else:
                 print(f"[CF] Solver returned {resp.status_code} for {host}")
 
@@ -173,6 +186,7 @@ class MediaFlight:
         self.content_type: str = "application/octet-stream"
         self.response_headers: dict = {}
         self.cacheable = False
+        self.total_size: Optional[int] = None  # for range requests on in-flight streams
 
 
 def model_to_dict(model: BaseModel) -> dict:
@@ -259,6 +273,7 @@ async def assert_safe_url(url: str) -> None:
                 status_code=403,
                 detail=f"Blocked unsafe resolved IP: {ip}",
             )
+
     if not resolved_ips:
         raise HTTPException(status_code=403, detail="Host resolved to no IPs.")
 
@@ -383,7 +398,6 @@ def decode_proxy_data(base64_data: str) -> ProxyData:
         padding_needed = (4 - len(base64_data) % 4) % 4
         base64_data += "=" * padding_needed
 
-        # validate=True already rejects any non-base64 characters with binascii.Error
         decoded_bytes = base64.urlsafe_b64decode(base64_data)
         json_data = json.loads(decoded_bytes.decode("utf-8"))
         data = ProxyData(**json_data)
@@ -737,13 +751,13 @@ async def get_or_build_response(
             )
             inflight_requests[cache_key] = task
 
-    try:
-        return await task
-    finally:
-        if task.done():
-            async with inflight_lock:
-                if inflight_requests.get(cache_key) is task:
-                    inflight_requests.pop(cache_key, None)
+        try:
+            return await task
+        finally:
+            if task.done():
+                async with inflight_lock:
+                    if inflight_requests.get(cache_key) is task:
+                        inflight_requests.pop(cache_key, None)
 
 
 async def produce_media_flight(
@@ -774,6 +788,15 @@ async def produce_media_flight(
             upstream.status_code,
             first_request,
         )
+
+        # Track Content-Length for range-parsing on in-flight streams
+        cl_header = upstream.headers.get("content-length")
+        if cl_header:
+            try:
+                flight.total_size = int(cl_header)
+            except ValueError:
+                flight.total_size = None
+
         flight.ready.set()
 
         async for chunk in upstream.aiter_bytes(64 * 1024):
@@ -805,9 +828,9 @@ async def produce_media_flight(
         async with flight.condition:
             flight.done = True
             flight.condition.notify_all()
-        async with inflight_media_lock:
-            if inflight_media.get(cache_key) is flight:
-                inflight_media.pop(cache_key, None)
+    async with inflight_media_lock:
+        if inflight_media.get(cache_key) is flight:
+            inflight_media.pop(cache_key, None)
 
 
 async def media_flight_body(flight: MediaFlight):
@@ -820,13 +843,13 @@ async def media_flight_body(flight: MediaFlight):
         if index < len(flight.chunks):
             chunk = flight.chunks[index]
             index += 1
+            yield chunk
         elif flight.error:
             raise flight.error
         elif flight.done:
             break
         else:
             continue
-        yield chunk
 
 
 async def stream_media_with_shared_cache(
@@ -834,9 +857,22 @@ async def stream_media_with_shared_cache(
     proxy_data: ProxyData,
     request: Request,
 ):
+    """Serve media segments. Checks diskcache first; falls back to shared
+    in-flight download (which caches on completion). Supports both full and
+    range requests for cached content."""
+
+    # ── 1. Try diskcache (full object) ────────────────────────────────
     cached_value = await run_in_threadpool(cache.get, cache_key)
     if cached_value is not None:
         content, content_type, response_headers, status_code = cached_value
+
+        # Serve range from cached full body
+        range_header = request.headers.get("range")
+        if range_header:
+            range_resp = cached_range_response(cached_value, range_header)
+            if range_resp is not None:
+                return range_resp
+
         return Response(
             content=content,
             status_code=status_code,
@@ -844,6 +880,7 @@ async def stream_media_with_shared_cache(
             headers=response_headers,
         )
 
+    # ── 2. Reuse or create shared in-flight download ──────────────────
     async with inflight_media_lock:
         flight = inflight_media.get(cache_key)
         if flight is None:
@@ -858,6 +895,7 @@ async def stream_media_with_shared_cache(
                 )
             )
 
+    # Wait until the download has enough data to respond
     await flight.ready.wait()
 
     if flight.error is not None and not flight.chunks:
@@ -865,44 +903,50 @@ async def stream_media_with_shared_cache(
             raise flight.error
         raise HTTPException(status_code=502, detail=str(flight.error))
 
+    range_header = request.headers.get("range")
+
+    # ── 3. Range request on in-flight (not-yet-cached) stream ────────
+    if range_header:
+        # Wait for the full download so we can slice it.
+        # For small segments (typical hls.ts ≤ 2 MB) this is fast.
+        async with flight.condition:
+            await flight.condition.wait_for(lambda: flight.done or flight.error)
+
+        if flight.error:
+            raise flight.error
+
+        total_size = len(b"".join(flight.chunks))
+        parsed = parse_single_range(range_header, total_size)
+        if parsed is None:
+            return make_416_response(total_size)
+
+        start, end = parsed
+        body = b"".join(flight.chunks)[start : end + 1]
+        headers = dict(flight.response_headers)
+        headers.pop("Content-Length", None)
+        headers.pop("Content-Range", None)
+        headers.update(
+            {
+                "Content-Range": f"bytes {start}-{end}/{total_size}",
+                "Content-Length": str(len(body)),
+                "Accept-Ranges": "bytes",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Expose-Headers": "*",
+            }
+        )
+        return Response(
+            content=body,
+            status_code=206,
+            media_type=flight.content_type,
+            headers=headers,
+        )
+
+    # ── 4. Full stream (no range) ────────────────────────────────────
     return StreamingResponse(
         media_flight_body(flight),
         status_code=flight.status_code,
         media_type=flight.content_type,
         headers=flight.response_headers,
-    )
-
-
-async def stream_range_no_cache(proxy_data: ProxyData, request: Request):
-    request_headers = build_upstream_headers(proxy_data, request)
-    upstream = await safe_stream_get(proxy_data.url, request_headers)
-
-    if upstream.status_code >= 400:
-        body = await upstream.aread()
-        await upstream.aclose()
-        raise HTTPException(
-            status_code=upstream.status_code,
-            detail=f"Upstream returned {upstream.status_code}: {body[:200]!r}",
-        )
-
-    content_type = determine_content_type(
-        proxy_data.url,
-        upstream.headers.get("content-type", ""),
-    )
-    response_headers = build_downstream_media_headers(upstream)
-
-    async def body():
-        try:
-            async for chunk in upstream.aiter_bytes(64 * 1024):
-                yield chunk
-        finally:
-            await upstream.aclose()
-
-    return StreamingResponse(
-        body(),
-        status_code=upstream.status_code,
-        media_type=content_type,
-        headers=response_headers,
     )
 
 
@@ -941,9 +985,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="M3U8 Proxy Server",
     description="A FastAPI server to proxy and rewrite M3U8 playlists.",
-    version="2.3.1",
+    version="2.3.2",
     lifespan=lifespan,
 )
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -952,6 +997,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 cache = Cache(
     cache_dir,
@@ -966,15 +1012,7 @@ async def m3u8_proxy(base64_data: str, request: Request):
     await assert_safe_url(proxy_data.url)
     cache_key = build_cache_key(proxy_data)
 
-    range_header = request.headers.get("range")
-    if range_header:
-        cached_value = await run_in_threadpool(cache.get, cache_key)
-        if cached_value is not None:
-            range_response = cached_range_response(cached_value, range_header)
-            if range_response is not None:
-                return range_response
-        return await stream_range_no_cache(proxy_data, request)
-
+    # Playlists (.m3u8) — always served without range logic
     if is_probably_playlist(proxy_data):
         content, content_type, response_headers, status_code = (
             await get_or_build_response(
@@ -990,6 +1028,8 @@ async def m3u8_proxy(base64_data: str, request: Request):
             headers=response_headers,
         )
 
+    # All media segments (.ts, .m4s, .mp4, etc.) — route through shared cache.
+    # Handles full requests and range requests on both cached and in-flight streams.
     return await stream_media_with_shared_cache(
         cache_key,
         proxy_data,
@@ -1015,7 +1055,7 @@ def read_root():
     return {
         "status": "online",
         "service": "M3U8 Proxy Server",
-        "version": "2.3.1",
+        "version": "2.3.2",
         "endpoint": "/url/<base64_data>",
         "public_base_url": PUBLIC_BASE_URL or None,
         "cache": {
