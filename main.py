@@ -104,7 +104,6 @@ class CFSolver:
         if not CURL_CFFI_AVAILABLE:
             return
         host = self._host(url)
-
         async with self._master:
             lock = self._domain_locks.get(host)
             if lock is None:
@@ -115,7 +114,6 @@ class CFSolver:
             if host in self._domain_solved:
                 return
 
-            # Strip headers that curl-impersonate manages itself (JA3, UA, etc.)
             curl_headers = {}
             for k in ("Referer", "Origin"):
                 if headers.get(k):
@@ -171,11 +169,9 @@ class MediaFlight:
         self.error: Optional[BaseException] = None
         self.ready = asyncio.Event()
         self.condition = asyncio.Condition()
-
         self.status_code: int = 200
         self.content_type: str = "application/octet-stream"
         self.response_headers: dict = {}
-
         self.cacheable = False
 
 
@@ -200,10 +196,6 @@ def resolve_url(base_url: str, relative_url: str) -> str:
 
 
 def is_ip_blocked(ip: ipaddress._BaseAddress) -> bool:
-    """
-    Blocks private, loopback, link-local, multicast, reserved, unspecified,
-    and other non-global addresses.
-    """
     if not ip.is_global:
         return True
     if ip == ipaddress.ip_address("169.254.169.254"):
@@ -218,23 +210,19 @@ def is_safe_url_syntax(url: str) -> bool:
             return False
         if not parsed.hostname:
             return False
-
         hostname = parsed.hostname.strip().lower().rstrip(".")
         if hostname in BLOCKED_HOSTNAMES:
             return False
         if hostname.endswith(".localhost"):
             return False
-
         if "." not in hostname and not re.match(r"^\[?[0-9a-f:.]+\]?$", hostname):
             return False
-
         try:
             ip = ipaddress.ip_address(hostname)
             if is_ip_blocked(ip):
                 return False
         except ValueError:
             pass
-
         return True
     except Exception:
         return False
@@ -243,12 +231,10 @@ def is_safe_url_syntax(url: str) -> bool:
 async def assert_safe_url(url: str) -> None:
     if not is_safe_url_syntax(url):
         raise HTTPException(status_code=403, detail="Unsafe or invalid URL requested.")
-
     parsed = urlparse(url)
     hostname = parsed.hostname
     if not hostname:
         raise HTTPException(status_code=403, detail="Unsafe or invalid URL requested.")
-
     try:
         infos = await run_in_threadpool(
             socket.getaddrinfo,
@@ -267,14 +253,12 @@ async def assert_safe_url(url: str) -> None:
             ip = ipaddress.ip_address(ip_text)
         except ValueError:
             raise HTTPException(status_code=403, detail="Invalid resolved IP.")
-
         resolved_ips.add(str(ip))
         if is_ip_blocked(ip):
             raise HTTPException(
                 status_code=403,
                 detail=f"Blocked unsafe resolved IP: {ip}",
             )
-
     if not resolved_ips:
         raise HTTPException(status_code=403, detail="Host resolved to no IPs.")
 
@@ -282,7 +266,6 @@ async def assert_safe_url(url: str) -> None:
 def determine_content_type(url: str, response_content_type: str) -> str:
     url_lower = url.lower()
     upstream_ct = (response_content_type or "").split(";", 1)[0].strip().lower()
-
     if ".m3u8" in url_lower:
         return "application/vnd.apple.mpegurl"
     if ".ts" in url_lower:
@@ -363,16 +346,19 @@ def rewrite_m3u8_urls(
     base_url = original_data.url
     lines = content.splitlines()
     rewritten_lines = []
+
     for line in lines:
         stripped = line.strip()
         if not stripped:
             rewritten_lines.append(line)
             continue
+
         if stripped.startswith("#"):
             rewritten_lines.append(
                 rewrite_uri_attributes(line, base_url, original_data, server_origin)
             )
             continue
+
         try:
             absolute_url = resolve_url(base_url, stripped)
             proxied_url = build_proxied_url(absolute_url, original_data, server_origin)
@@ -380,25 +366,24 @@ def rewrite_m3u8_urls(
         except Exception as e:
             print(f"Error rewriting URL '{stripped}': {e}")
             rewritten_lines.append(line)
+
     return "\n".join(rewritten_lines) + ("\n" if content.endswith("\n") else "")
 
 
 def decode_proxy_data(base64_data: str) -> ProxyData:
     try:
+        # Strip .m3u8 suffix first
         if base64_data.endswith(".m3u8"):
             base64_data = base64_data[:-5]
 
+        # Strip trailing slashes/whitespace
         base64_data = base64_data.rstrip("/ \t\r\n")
 
-        if not re.fullmatch(r"[A-Za-z0-9\-_]+", base64_data):
-            raise HTTPException(
-                status_code=400,
-                detail="Proxy data contains invalid characters.",
-            )
-
+        # Re-add base64 padding that was stripped on encode
         padding_needed = (4 - len(base64_data) % 4) % 4
         base64_data += "=" * padding_needed
 
+        # validate=True already rejects any non-base64 characters with binascii.Error
         decoded_bytes = base64.b64decode(
             base64_data,
             altchars=b"-_",
@@ -454,7 +439,6 @@ def build_upstream_headers(
 
     if proxy_data.origin:
         headers["Origin"] = proxy_data.origin
-
     if proxy_data.referer:
         headers["Referer"] = proxy_data.referer
     elif proxy_data.origin:
@@ -478,7 +462,7 @@ async def safe_get(
     url: str,
     headers: dict,
     *,
-    _allow_cf_solve: bool = True,
+    allow_cf_solve: bool = True,
 ) -> httpx.Response:
     if http_client is None:
         raise HTTPException(status_code=503, detail="HTTP client not initialized")
@@ -504,14 +488,14 @@ async def safe_get(
             await response.aclose()
             continue
 
-        if _allow_cf_solve and cf_solver.is_challenge(response):
+        if allow_cf_solve and cf_solver.is_challenge(response):
             cf_solver.invalidate(current_url)
             await cf_solver.solve(current_url, current_headers)
             await response.aclose()
             return await safe_get(
                 current_url,
                 current_headers,
-                _allow_cf_solve=False,
+                allow_cf_solve=False,
             )
 
         return response
@@ -655,11 +639,9 @@ def build_downstream_media_headers(upstream: httpx.Response) -> dict:
 
 async def fetch_upstream_result(proxy_data: ProxyData, request: Request):
     request_headers = build_upstream_headers(proxy_data, request=None)
-
     try:
         upstream = await safe_get(proxy_data.url, headers=request_headers)
         upstream.raise_for_status()
-
     except httpx.HTTPStatusError as e:
         if cf_solver.is_challenge(e.response):
             raise HTTPException(
@@ -682,6 +664,7 @@ async def fetch_upstream_result(proxy_data: ProxyData, request: Request):
         proxy_data.url,
         upstream.headers.get("content-type", ""),
     )
+
     is_m3u8 = ".m3u8" in proxy_data.url.lower() or content_type in M3U8_CONTENT_TYPES
     will_modify = proxy_data.src and is_m3u8
     is_live_playlist = False
@@ -751,6 +734,7 @@ async def get_or_build_response(
         cached_value = await run_in_threadpool(cache.get, cache_key)
         if cached_value is not None:
             return cached_value
+
         task = inflight_requests.get(cache_key)
         if task is None:
             task = asyncio.create_task(
@@ -820,7 +804,6 @@ async def produce_media_flight(
     except BaseException as e:
         flight.error = e
         flight.ready.set()
-
     finally:
         if upstream is not None:
             await upstream.aclose()
@@ -928,6 +911,8 @@ async def stream_range_no_cache(proxy_data: ProxyData, request: Request):
     )
 
 
+# ── App setup ──────────────────────────────────────────────────────────
+
 cache_size_gb = float(os.getenv("CACHE_SIZE", "0.4"))
 cache_size_bytes = int(cache_size_gb * 1024 * 1024 * 1024)
 cache_dir = os.getenv("CACHE_DIR", "/tmp/m3u8_cache")
@@ -936,7 +921,6 @@ cache_dir = os.getenv("CACHE_DIR", "/tmp/m3u8_cache")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
-
     http_client = httpx.AsyncClient(
         http2=True,
         follow_redirects=False,
@@ -962,7 +946,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="M3U8 Proxy Server",
     description="A FastAPI server to proxy and rewrite M3U8 playlists.",
-    version="2.3.0",
+    version="2.3.1",
     lifespan=lifespan,
 )
 
@@ -985,10 +969,9 @@ cache = Cache(
 async def m3u8_proxy(base64_data: str, request: Request):
     proxy_data = decode_proxy_data(base64_data)
     await assert_safe_url(proxy_data.url)
-
     cache_key = build_cache_key(proxy_data)
-    range_header = request.headers.get("range")
 
+    range_header = request.headers.get("range")
     if range_header:
         cached_value = await run_in_threadpool(cache.get, cache_key)
         if cached_value is not None:
@@ -1037,7 +1020,7 @@ def read_root():
     return {
         "status": "online",
         "service": "M3U8 Proxy Server",
-        "version": "2.3.0",
+        "version": "2.3.1",
         "endpoint": "/url/<base64_data>",
         "public_base_url": PUBLIC_BASE_URL or None,
         "cache": {
